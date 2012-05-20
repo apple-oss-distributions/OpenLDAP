@@ -1,8 +1,8 @@
 /* os-ip.c -- platform-specific TCP & UDP related code */
-/* $OpenLDAP: pkg/ldap/libraries/libldap/os-ip.c,v 1.118.2.20 2010/04/13 20:22:58 kurt Exp $ */
+/* $OpenLDAP$ */
 /* This work is part of OpenLDAP Software <http://www.openldap.org/>.
  *
- * Copyright 1998-2010 The OpenLDAP Foundation.
+ * Copyright 1998-2011 The OpenLDAP Foundation.
  * Portions Copyright 1999 Lars Uffmann.
  * All rights reserved.
  *
@@ -603,16 +603,12 @@ ldap_connect_to_host(LDAP *ld, Sockbuf *sb,
 	hints.ai_socktype = socktype;
 	snprintf(serv, sizeof serv, "%d", port );
 
-#ifdef LDAP_R_COMPILE
 	/* most getaddrinfo(3) use non-threadsafe resolver libraries */
-	ldap_pvt_thread_mutex_lock(&ldap_int_resolv_mutex);
-#endif
+	LDAP_MUTEX_LOCK(&ldap_int_resolv_mutex);
 
 	err = getaddrinfo( host, serv, &hints, &res );
 
-#ifdef LDAP_R_COMPILE
-	ldap_pvt_thread_mutex_unlock(&ldap_int_resolv_mutex);
-#endif
+	LDAP_MUTEX_UNLOCK(&ldap_int_resolv_mutex);
 
 	if ( err != 0 ) {
 		osip_debug(ld, "ldap_connect_to_host: getaddrinfo failed: %s\n",
@@ -738,9 +734,9 @@ ldap_connect_to_host(LDAP *ld, Sockbuf *sb,
 			async);
    
 		if ( (rc == 0) || (rc == -2) ) {
-			i = ldap_int_connect_cbs( ld, sb, &s, srv, (struct sockaddr *)&sin );
-			if ( i )
-				rc = i;
+			int err = ldap_int_connect_cbs( ld, sb, &s, srv, (struct sockaddr *)&sin );
+			if ( err )
+				rc = err;
 			else
 				break;
 		}
@@ -853,11 +849,13 @@ ldap_host_connected_to( Sockbuf *sb, const char *host )
 struct selectinfo {
 #ifdef HAVE_POLL
 	/* for UNIX poll(2) */
-	int si_maxfd; /* max fds, i.e. how far to search si_fds */
-	int si_nfds;  /* current # fds */
+	int si_maxfd;
+#ifdef __APPLE__    
+    int si_nfds;  /* current # fds */
 	int si_update_done; /* cond var predicate */
 	int si_pipe_fds[2];
 	int si_pipe_fd_idx_in_poll;
+#endif    
 	struct pollfd si_fds[FD_SETSIZE];
 #else
 	/* for UNIX select(2) */
@@ -868,13 +866,13 @@ struct selectinfo {
 #endif
 };
 
-
+#ifdef __APPLE__
 struct updatecmd {
 	int type;
-	#define LDAP_SEL_UPDATE_READ  1
-	#define LDAP_SEL_UPDATE_WRITE 2
-	#define LDAP_SEL_UPDATE_CLEAR 3
-
+#define LDAP_SEL_UPDATE_READ  1
+#define LDAP_SEL_UPDATE_WRITE 2
+#define LDAP_SEL_UPDATE_CLEAR 3
+    
 	ber_socket_t sd;
 };
 
@@ -886,7 +884,7 @@ static void
 ldap_int_queue_select_update( struct selectinfo *sip, ber_socket_t sd, int cmdtype )
 {
 	Debug( LDAP_DEBUG_ASYNC, "ldap_queue_select_update: sip = %p, sd = %d, cmdtype = %d\n", sip, (int)sd, cmdtype );
-
+    
 	/* Send the command to the select/poll thread. */
 	struct updatecmd cmd = {cmdtype, sd};
 	write( sip->si_pipe_fds[1], &cmd, sizeof(cmd) );
@@ -896,14 +894,14 @@ static void
 ldap_int_handle_select_updates( struct selectinfo *sip )
 {
 	struct updatecmd cmd;
-
+    
 	Debug( LDAP_DEBUG_ASYNC, "ldap_int_handle_select_updates: sip = %p\n", sip, 0, 0 );
-
+    
 	while ( read( sip->si_pipe_fds[0], &cmd, sizeof(cmd) ) == sizeof(cmd) ) {
-
+        
 		Debug( LDAP_DEBUG_ASYNC, "ldap_int_handle_select_updates: sip = %p, cmd.sd = %d, cmd.type = %d\n",
-		       sip, cmd.sd, cmd.type );
-
+              sip, cmd.sd, cmd.type );
+        
 		switch ( cmd.type ) {
 			case LDAP_SEL_UPDATE_READ:
 				ldap_int_mark_select_read( sip, cmd.sd );
@@ -927,7 +925,7 @@ ldap_int_mark_select_write( struct selectinfo *sip, ber_socket_t sd )
 	/* for UNIX poll(2) */
 	{
 		Debug( LDAP_DEBUG_ASYNC, "ldap_int_mark_select_write: sip = %p, sd = %d\n", sip, (int)sd, 0 );
-
+        
 		int empty=-1;
 		int i;
 		for(i=0; i < sip->si_maxfd; i++) {
@@ -939,7 +937,7 @@ ldap_int_mark_select_write( struct selectinfo *sip, ber_socket_t sd )
 				empty=i;
 			}
 		}
-
+        
 		if( empty == -1 ) {
 			if( sip->si_maxfd >= FD_SETSIZE ) {
 				/* FIXME */
@@ -947,7 +945,7 @@ ldap_int_mark_select_write( struct selectinfo *sip, ber_socket_t sd )
 			}
 			empty = sip->si_maxfd++;
 		}
-
+        
 		sip->si_fds[empty].fd = sd;
 		sip->si_fds[empty].events = POLL_WRITE;
 		sip->si_nfds++;
@@ -961,27 +959,6 @@ ldap_int_mark_select_write( struct selectinfo *sip, ber_socket_t sd )
 #endif
 }
 
-void
-ldap_mark_select_write( LDAP *ld, Sockbuf *sb )
-{
-	struct selectinfo	*sip;
-	ber_socket_t		sd;
-
-	sip = (struct selectinfo *)ld->ld_selectinfo;
-	
-	ber_sockbuf_ctrl( sb, LBER_SB_OPT_GET_FD, &sd );
-
-	Debug( LDAP_DEBUG_ASYNC, "ldap_mark_select_write: sip = %p, sd = %d\n", sip, (int)sd, 0 );
-
-	if ( LDAP_BOOL_GET( &ld->ld_options, LDAP_BOOL_ASYNC_RESULTS ) ) {
-		ldap_int_queue_select_update( sip, sd, LDAP_SEL_UPDATE_WRITE );
-	}
-	else {
-		ldap_int_mark_select_write( sip, sd );
-	}
-}
-
-
 static int
 ldap_int_mark_select_read( struct selectinfo *sip, ber_socket_t sd )
 {
@@ -989,7 +966,7 @@ ldap_int_mark_select_read( struct selectinfo *sip, ber_socket_t sd )
 	/* for UNIX poll(2) */
 	{
 		Debug( LDAP_DEBUG_ASYNC, "ldap_int_mark_select_read: sip = %p, sd = %d\n", sip, (int)sd, 0 );
-
+        
 		int empty=-1;
 		int i;
 		for(i=0; i < sip->si_maxfd; i++) {
@@ -1001,7 +978,7 @@ ldap_int_mark_select_read( struct selectinfo *sip, ber_socket_t sd )
 				empty=i;
 			}
 		}
-
+        
 		if( empty == -1 ) {
 			if( sip->si_maxfd >= FD_SETSIZE ) {
 				/* FIXME */
@@ -1009,12 +986,12 @@ ldap_int_mark_select_read( struct selectinfo *sip, ber_socket_t sd )
 			}
 			empty = sip->si_maxfd++;
 		}
-
+        
 		sip->si_fds[empty].fd = sd;
 		sip->si_fds[empty].events = POLL_READ;
 		sip->si_nfds++;
 		return empty;
-
+        
 	}
 #else
 	/* for UNIX select(2) */
@@ -1024,27 +1001,6 @@ ldap_int_mark_select_read( struct selectinfo *sip, ber_socket_t sd )
 #endif
 }
 
-void
-ldap_mark_select_read( LDAP *ld, Sockbuf *sb )
-{
-	struct selectinfo	*sip;
-	ber_socket_t		sd;
-
-	sip = (struct selectinfo *)ld->ld_selectinfo;
-	
-	ber_sockbuf_ctrl( sb, LBER_SB_OPT_GET_FD, &sd );
-
-	Debug( LDAP_DEBUG_ASYNC, "ldap_mark_select_read: sip = %p, sd = %d\n", sip, (int)sd, 0 );
-
-	if ( LDAP_BOOL_GET( &ld->ld_options, LDAP_BOOL_ASYNC_RESULTS ) ) {
-		ldap_int_queue_select_update( sip, sd, LDAP_SEL_UPDATE_READ );
-	}
-	else {
-		ldap_int_mark_select_read( sip, sd );
-	}
-}
-
-
 static void
 ldap_int_mark_select_clear( struct selectinfo *sip, ber_socket_t sd )
 {
@@ -1052,7 +1008,7 @@ ldap_int_mark_select_clear( struct selectinfo *sip, ber_socket_t sd )
 	/* for UNIX poll(2) */
 	{
 		Debug( LDAP_DEBUG_ASYNC, "ldap_int_mark_select_clear: sip = %p, sd = %d\n", sip, (int)sd, 0 );
-
+        
 		int i;
 		for(i=0; i < sip->si_maxfd; i++) {
 			if( sip->si_fds[i].fd == sd ) {
@@ -1068,8 +1024,9 @@ ldap_int_mark_select_clear( struct selectinfo *sip, ber_socket_t sd )
 #endif
 }
 
+#endif /*__APPLE__*/
 void
-ldap_mark_select_clear( LDAP *ld, Sockbuf *sb )
+ldap_mark_select_write( LDAP *ld, Sockbuf *sb )
 {
 	struct selectinfo	*sip;
 	ber_socket_t		sd;
@@ -1078,14 +1035,142 @@ ldap_mark_select_clear( LDAP *ld, Sockbuf *sb )
 	
 	ber_sockbuf_ctrl( sb, LBER_SB_OPT_GET_FD, &sd );
 
-	Debug( LDAP_DEBUG_ASYNC, "ldap_mark_select_clear: sip = %p, sd = %d\n", sip, (int)sd, 0 );
+#ifdef __APPLE__
+    Debug( LDAP_DEBUG_ASYNC, "ldap_mark_select_write: sip = %p, sd = %d\n", sip, (int)sd, 0 );
+    
+	if ( LDAP_BOOL_GET( &ld->ld_options, LDAP_BOOL_ASYNC_RESULTS ) ) {
+		ldap_int_queue_select_update( sip, sd, LDAP_SEL_UPDATE_WRITE );
+	}
+	else {
+		ldap_int_mark_select_write( sip, sd );
+	}
+#else
+#ifdef HAVE_POLL
+	/* for UNIX poll(2) */
+	{
+		int empty=-1;
+		int i;
+		for(i=0; i < sip->si_maxfd; i++) {
+			if( sip->si_fds[i].fd == sd ) {
+				sip->si_fds[i].events |= POLL_WRITE;
+				return;
+			}
+			if( empty==-1 && sip->si_fds[i].fd == -1 ) {
+				empty=i;
+			}
+		}
 
+		if( empty == -1 ) {
+			if( sip->si_maxfd >= FD_SETSIZE ) {
+				/* FIXME */
+				return;
+			}
+			empty = sip->si_maxfd++;
+		}
+
+		sip->si_fds[empty].fd = sd;
+		sip->si_fds[empty].events = POLL_WRITE;
+	}
+#else
+	/* for UNIX select(2) */
+	if ( !FD_ISSET( sd, &sip->si_writefds )) {
+		FD_SET( sd, &sip->si_writefds );
+	}
+#endif
+#endif /*__APPLE__*/    
+}
+
+
+void
+ldap_mark_select_read( LDAP *ld, Sockbuf *sb )
+{
+	struct selectinfo	*sip;
+	ber_socket_t		sd;
+
+	sip = (struct selectinfo *)ld->ld_selectinfo;
+
+	ber_sockbuf_ctrl( sb, LBER_SB_OPT_GET_FD, &sd );
+#ifdef __APPLE__
+    Debug( LDAP_DEBUG_ASYNC, "ldap_mark_select_read: sip = %p, sd = %d\n", sip, (int)sd, 0 );
+    
+	if ( LDAP_BOOL_GET( &ld->ld_options, LDAP_BOOL_ASYNC_RESULTS ) ) {
+		ldap_int_queue_select_update( sip, sd, LDAP_SEL_UPDATE_READ );
+	}
+	else {
+		ldap_int_mark_select_read( sip, sd );
+	}
+#else    
+#ifdef HAVE_POLL
+	/* for UNIX poll(2) */
+	{
+		int empty=-1;
+		int i;
+		for(i=0; i < sip->si_maxfd; i++) {
+			if( sip->si_fds[i].fd == sd ) {
+				sip->si_fds[i].events |= POLL_READ;
+				return;
+			}
+			if( empty==-1 && sip->si_fds[i].fd == -1 ) {
+				empty=i;
+			}
+		}
+
+		if( empty == -1 ) {
+			if( sip->si_maxfd >= FD_SETSIZE ) {
+				/* FIXME */
+				return;
+			}
+			empty = sip->si_maxfd++;
+		}
+
+		sip->si_fds[empty].fd = sd;
+		sip->si_fds[empty].events = POLL_READ;
+	}
+#else
+	/* for UNIX select(2) */
+	if ( !FD_ISSET( sd, &sip->si_readfds )) {
+		FD_SET( sd, &sip->si_readfds );
+	}
+#endif
+#endif /*__APPLE__*/    
+}
+
+
+void
+ldap_mark_select_clear( LDAP *ld, Sockbuf *sb )
+{
+	struct selectinfo	*sip;
+	ber_socket_t		sd;
+
+	sip = (struct selectinfo *)ld->ld_selectinfo;
+
+	ber_sockbuf_ctrl( sb, LBER_SB_OPT_GET_FD, &sd );
+#ifdef __APPLE__
+    Debug( LDAP_DEBUG_ASYNC, "ldap_mark_select_clear: sip = %p, sd = %d\n", sip, (int)sd, 0 );
+    
 	if ( LDAP_BOOL_GET( &ld->ld_options, LDAP_BOOL_ASYNC_RESULTS ) ) {
 		ldap_int_queue_select_update( sip, sd, LDAP_SEL_UPDATE_CLEAR );
 	}
 	else {
 		ldap_int_mark_select_clear( sip, sd );
 	}
+#else    
+#ifdef HAVE_POLL
+	/* for UNIX poll(2) */
+	{
+		int i;
+		for(i=0; i < sip->si_maxfd; i++) {
+			if( sip->si_fds[i].fd == sd ) {
+				sip->si_fds[i].fd = -1;
+			}
+		}
+	}
+#else
+	/* for UNIX select(2) */
+	FD_CLR( sd, &sip->si_writefds );
+	FD_CLR( sd, &sip->si_readfds );
+#endif
+#endif /*__APPLE__*/    
 }
 
 
@@ -1232,8 +1317,6 @@ ldap_new_select_info( void )
 
 	if ( sip == NULL ) return NULL;
 
-	Debug( LDAP_DEBUG_ASYNC, "ldap_new_select_info: sip = %p\n", sip, 0, 0);
-
 #ifdef HAVE_POLL
 	/* for UNIX poll(2) */
 	/* sip->si_maxfd=0 */
@@ -1255,8 +1338,6 @@ ldap_new_select_info( void )
 void
 ldap_free_select_info( void *sip )
 {
-	Debug( LDAP_DEBUG_ASYNC, "ldap_free_select_info: sip = %p\n", sip, 0, 0);
-
 	LDAP_FREE( sip );
 }
 
@@ -1307,26 +1388,37 @@ ldap_int_select( LDAP *ld, struct timeval *timeout )
 
 	tryagain:
 
-		/* If there are no fds left don't call poll(2).	 No fds and an
-		 * infinite timeout will result in a hang.
-		 * If there are still fds, but we're no longer watching the
-		 * pipe, that's another good reason to bail.
-		 */
-		 if ( LDAP_BOOL_GET(&ld->ld_options, LDAP_BOOL_ASYNC_RESULTS) &&
-		      ( sip->si_nfds == 0 || sip->si_fds[sip->si_pipe_fd_idx_in_poll].fd == -1 ) )
-		 {
-			 Debug( LDAP_DEBUG_ASYNC, "ldap_int_select: %s\n",
-                                sip->si_nfds == 0 ? "no fds being watched" : "pipe not being watched",
-                                0, 0 );
+                if ( LDAP_BOOL_GET(&ld->ld_options, LDAP_BOOL_ASYNC_RESULTS)) {
 
-			 /* If we're not even watching the select pipe, then
-			  * close it.  We're going to return an errno that will
-			  * cause the async thread to exit anyway.
-			  */
-			 ldap_int_close_select_pipe( sip );
+                        /* Clear any fd's that got an error last time.  If we
+                         * don't we'll just spin.
+                         */
+                        int i;
+                        for ( i = 0;  i < sip->si_maxfd; i++ ) { 
+                                if ( sip->si_fds[i].revents & (POLLERR|POLLHUP|POLLNVAL) ) {
+                                    ldap_int_mark_select_clear( sip, sip->si_fds[i].fd );
+                                }
+                        }
 
-			 errno = EPIPE;
-			 return -1;
+                        /* If there are no fds left don't call poll(2).  No fds and an
+                         * infinite timeout will result in a hang.
+                         * If there are still fds, but we're no longer watching the
+                         * pipe, that's another good reason to bail.
+                         */
+                        if ( sip->si_nfds == 0 || sip->si_fds[sip->si_pipe_fd_idx_in_poll].fd == -1 ) {
+                                Debug( LDAP_DEBUG_ASYNC, "ldap_int_select: %s\n",
+                                       sip->si_nfds == 0 ? "no fds being watched" : "pipe not being watched",
+                                       0, 0 );
+
+                                /* If we're not even watching the select pipe, then
+                                 * close it.  We're going to return an errno that will
+                                 * cause the async thread to exit anyway.
+                                 */
+                                ldap_int_close_select_pipe( sip );
+
+                                errno = EPIPE;
+                                return -1;
+                        }
 		}
 
 		/* There are still fds being watched... */
@@ -1336,42 +1428,17 @@ ldap_int_select( LDAP *ld, struct timeval *timeout )
 
 #ifdef __APPLE__
 		if ( LDAP_BOOL_GET(&ld->ld_options, LDAP_BOOL_ASYNC_RESULTS) ) {
-			if (rc > 0)
+			if ( rc > 0 )
 			{
-				/* Handle any updates. */
-				if ( sip->si_fds[sip->si_pipe_fd_idx_in_poll].revents & POLLIN ) {
-                                        Debug( LDAP_DEBUG_ASYNC, "ldap_int_select: got update on pipe, rc = %d\n", rc, 0, 0 );
-					ldap_int_handle_select_updates( sip );
-					--rc; /* don't count updates */
-
-					/* If this is the only reason we woke
-					 * go back to poll.
-					 */
-					if ( rc == 0 ) goto tryagain;
-				}
-
-				/* Check if any of the fds were closed while in
-				 * poll.  Updates via the pipe will catch some
-				 * of these, but poll returns POLLNVAL before
-				 * POLLIN.  So we can see closed fds before we
-				 * get a chance to read the update from the pipe
-				 * (happens if we're not in poll when the update
-				 * comes in and the fd is closed).
-				 */
-				int back_to_poll = 0;
-				int i;
-				for ( i = 0; i < sip->si_maxfd; i++ ) {
-					if ( sip->si_fds[i].revents & (POLLHUP|POLLERR|POLLNVAL) ) {
-						Debug( LDAP_DEBUG_ASYNC,
-						       "ldap_int_select: fd %d was closed while in poll()\n",
-						       sip->si_fds[i].fd, 0, 0 );
-
-						// Just remove the fd from pollfds.
-						ldap_int_mark_select_clear( sip, sip->si_fds[i].fd );
-						back_to_poll = 1;
-					}
-				}
-				if (back_to_poll) goto tryagain;
+                                /* Handle updates on the pipe.  If it's the only
+                                 * activity, then go back to the top.
+                                 */
+                                if ( sip->si_fds[sip->si_pipe_fd_idx_in_poll].revents & POLLIN ) {
+                                        ldap_int_handle_select_updates( sip );
+                                        if ( rc == 1 ) {
+                                                goto tryagain;
+                                        }
+                                }
 			}
 		}
 #endif /* __APPLE__ */
