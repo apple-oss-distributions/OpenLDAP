@@ -542,6 +542,57 @@ tlsst_identity_validate(SecIdentityRef identity, const char *setting_name)
 	return ok;
 }
 
+static void 
+tlsst_get_cert_chain(CFMutableArrayRef certificateChain,   SecCertificateRef certificateRef )
+{
+	if (!certificateRef) {
+		return;
+	}
+
+	OSStatus status = noErr;
+	SecPolicyRef policyRef = NULL;
+
+	policyRef = SecPolicyCreateBasicX509 ();
+	if (!policyRef) {
+		Debug(LDAP_DEBUG_ANY,"SecPolicyCreateBasicX509 returned NULL\n", 0, 0, 0);
+	} else {
+		SecTrustRef trustRef;
+		CFMutableArrayRef leafCertArray = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+
+		CFArrayAppendValue(leafCertArray, certificateRef);	
+		status = SecTrustCreateWithCertificates((CFArrayRef)leafCertArray, policyRef, &trustRef);
+		if(status != noErr) {
+			Debug(LDAP_DEBUG_ANY,"%s: SecTrustCreateWithCertificates() status: %d", __PRETTY_FUNCTION__, status, 0);
+		} else {
+			status = SecTrustSetOptions (trustRef, kSecTrustOptionLeafIsCA );
+			if(status != noErr) {
+				Debug(LDAP_DEBUG_ANY,"%s: SecTrustSetOptions() status: %d", __PRETTY_FUNCTION__, status, 0);
+			}			
+			else {
+				SecTrustResultType result;
+				status = SecTrustEvaluate(trustRef, &result);
+				if(status != noErr) {
+					Debug(LDAP_DEBUG_ANY,"%s: SecTrustEvaluate() status: %d", __PRETTY_FUNCTION__, status, 0);
+				}
+				else {
+					CFIndex count = SecTrustGetCertificateCount(trustRef);
+					CFIndex i;
+					for (i = 0;  i < count;	 i++) {
+						SecCertificateRef certInChainRef = SecTrustGetCertificateAtIndex(trustRef, i);
+						if (certInChainRef &&  !CFEqual(certificateRef, certInChainRef)) { // identityRef in certificateChain[0] includes leaf cert , exclude it when appending to certificateChain
+							CFArrayAppendValue(certificateChain, certInChainRef);
+						}
+					}
+				}
+			}
+			CFRelease_and_null(trustRef);
+		}
+	
+		CFRelease_and_null(leafCertArray);
+	}
+	CFRelease_and_null(policyRef);
+}
+
 static CFArrayRef
 tlsst_identity_certs_get(const char *identity, const char *setting_name)
 {
@@ -550,7 +601,7 @@ tlsst_identity_certs_get(const char *identity, const char *setting_name)
 	if (identity == NULL || *identity == '\0')
 		return NULL;
 
-	CFArrayRef certs = NULL;
+	CFMutableArrayRef certs = NULL;
 
 	SecIdentityRef identRef = SecIdentityCopyPreferred(CFSTR("OPENDIRECTORY_SSL_IDENTITY"), NULL, NULL);
 	if (identRef != NULL)
@@ -575,12 +626,25 @@ tlsst_identity_certs_get(const char *identity, const char *setting_name)
 	if (identRef != NULL) {
 		/* the private key must be usable */
 		if (tlsst_identity_validate(identRef, setting_name)) {
-			certs = CFArrayCreate(NULL, (const void **) &identRef, 1, &kCFTypeArrayCallBacks);
-			if (certs == NULL)
-				syslog(LOG_ERR, "TLS: CFArrayCreate() failed");
-		} else
+			SecCertificateRef certRef = NULL;
+			certs = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+			if (certs == NULL) {
+				syslog(LOG_ERR, "TLS: CFArrayCreateMutable() failed");
+			} else {
+				OSStatus status;
+				status = SecIdentityCopyCertificate(identRef, &certRef);
+				if (status) {
+					syslog(LOG_ERR, "TLS: SecIdentityCopyCertificate err (%d)", status);			
+				} else {
+					// add identityref as first item certificateChain[0]
+					CFArrayAppendValue(certs, identRef);
+					tlsst_get_cert_chain(certs, certRef);
+				}
+			}
+			CFRelease_and_null(certRef);
+		} else {
 			syslog(LOG_ERR, "TLS: Can't get or use private key for %s \"%s\"; is it application-restricted?", setting_name, identity);
-
+		}
 		CFRelease_and_null(identRef);
 	}
 
@@ -889,37 +953,6 @@ tlsst_copy_peer_cert(tlsst_session *sess)
 	return result;	// caller must release
 }
 
-static CFDataRef
-tlsst_builtin_dhparams(void)
-{
-	Debug(LDAP_DEBUG_TRACE, "tlsst_builtin_dhparams()\n", 0, 0, 0);
-
-	// output of command "openssl dhparam 1024"
-	static const char dhparams_pem[] =
-		// -----BEGIN DH PARAMETERS-----
-		"MIGHAoGBAOi2AYTgWEzB4TI07BKz4Z6H3oFKvCz77YAaPizFwUW5Jy7JDV6vXO8n"
-		"RrjSCuZ8V4TyfewkDW/iju5Rkgsy44UO9fGDLWjNG8fom92fuXBdNcbO8zAvG97B"
-		"mojNok6fpxvsFoUWWLmrlVPr/gtWANZAmSDr78ovtstQcdf5+6a7AgEC";
-		// -----END DH PARAMETERS-----
-
-	CFDataRef result = NULL;
-
-	CFDataRef pemData = CFDataCreateWithBytesNoCopy(NULL, (const UInt8 *) dhparams_pem, strlen(dhparams_pem), kCFAllocatorNull);
-	if (pemData != NULL) {
-		SecTransformRef decoder = SecDecodeTransformCreate(kSecBase64Encoding, NULL);
-		if (decoder != NULL) {
-			SecTransformSetAttribute(decoder, kSecTransformInputAttributeName, pemData, NULL);
-			result = SecTransformExecute(decoder, NULL);
-
-			CFRelease(decoder);
-		}
-
-		CFRelease_and_null(pemData);
-	}
-
-	return result;		// caller must release
-}
-
 static int
 tlsst_init(void)
 {
@@ -938,7 +971,6 @@ tlsst_init(void)
 	(void) tlsst_oss2buf(errSSLWouldBlock, buf, sizeof buf);
 
 	SecKeychainSetUserInteractionAllowed(false);
-	SecKeychainSetPreferenceDomain(kSecPreferencesDomainSystem);
 
 	return 0;
 }
@@ -1009,14 +1041,18 @@ tlsst_ctx_init(struct ldapoptions *lo, struct ldaptls *lt, int is_server)
 
 	if (lo->ldo_tls_protocol_min) {
 		ctx->protocol_min = tlsst_protocol_map_ldap2st(lo->ldo_tls_protocol_min, is_server ? "TLSProtocolMin" : "TLS_PROTOCOL_MIN");
-		if (ctx->protocol_min == kSSLProtocolUnknown)
+		if (ctx->protocol_min == kSSLProtocolUnknown) {
 			return -1;
-		else if (ctx->protocol_min == kSSLProtocol2) {
+		} else if (ctx->protocol_min == kSSLProtocol2) {
 			syslog(LOG_ERR, "TLS: SSLv2 is no longer supported (check %s setting)", is_server ? "TLSProtocolMin" : "TLS_PROTOCOL_MIN");
 			return -1;
+		} else if (ctx->protocol_min == kSSLProtocol3) {
+			syslog(LOG_ERR, "TLS: SSLv3 is no longer supported (check %s setting)", is_server ? "TLSProtocolMin" : "TLS_PROTOCOL_MIN");
+			return -1;
 		}
-	} else
-		ctx->protocol_min = kSSLProtocolUnknown;
+	} else {
+		ctx->protocol_min = kTLSProtocol1;
+	}
 	ctx->require_cert = lo->ldo_tls_require_cert;
 	ctx->crl_check = lo->ldo_tls_crlcheck;
 	ctx->ciphers = tlsst_ciphers_get(lo->ldo_tls_ciphersuite, &ctx->ciphers_count, is_server ? "TLSCipherSuite" : "TLS_CIPHER_SUITE");
@@ -1065,7 +1101,7 @@ tlsst_ctx_init(struct ldapoptions *lo, struct ldaptls *lt, int is_server)
 		} else
 			syslog(LOG_ERR, "TLS: CFStringCreateWithCString(%s) failed (check TLSDHParamFile setting)", lo->ldo_tls_dhfile);
 	} else {
-		ctx->dhparams = tlsst_builtin_dhparams();
+		ctx->dhparams = NULL;
 		result = 0;
 	}
 
