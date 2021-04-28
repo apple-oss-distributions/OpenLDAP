@@ -371,8 +371,7 @@ certificateListValidate( Syntax *syntax, struct berval *in )
 	/* Optional version */
 	if ( tag == LBER_INTEGER ) {
 		tag = ber_get_int( ber, &version );
-		assert( tag == LBER_INTEGER );
-		if ( version != SLAP_X509_V2 ) return LDAP_INVALID_SYNTAX;
+		if ( tag != LBER_INTEGER || version != SLAP_X509_V2 ) return LDAP_INVALID_SYNTAX;
 	}
 	tag = ber_skip_tag( ber, &len );	/* Signature Algorithm */
 	if ( tag != LBER_SEQUENCE ) return LDAP_INVALID_SYNTAX;
@@ -3181,7 +3180,7 @@ serialNumberAndIssuerCheck(
 
 	if( in->bv_len < 3 ) return LDAP_INVALID_SYNTAX;
 
-	if( in->bv_val[0] != '{' && in->bv_val[in->bv_len-1] != '}' ) {
+	if( in->bv_val[0] != '{' || in->bv_val[in->bv_len-1] != '}' ) {
 		/* Parse old format */
 		is->bv_val = ber_bvchr( in, '$' );
 		if( BER_BVISNULL( is ) ) return LDAP_INVALID_SYNTAX;
@@ -3212,7 +3211,7 @@ serialNumberAndIssuerCheck(
 			HAVE_ALL = ( HAVE_ISSUER | HAVE_SN )
 		} have = HAVE_NONE;
 
-		int numdquotes = 0;
+		int numdquotes = 0, gotquote;
 		struct berval x = *in;
 		struct berval ni;
 		x.bv_val++;
@@ -3254,11 +3253,12 @@ serialNumberAndIssuerCheck(
 				is->bv_val = x.bv_val;
 				is->bv_len = 0;
 
-				for ( ; is->bv_len < x.bv_len; ) {
+				for ( gotquote=0; is->bv_len < x.bv_len; ) {
 					if ( is->bv_val[is->bv_len] != '"' ) {
 						is->bv_len++;
 						continue;
 					}
+					gotquote = 1;
 					if ( is->bv_val[is->bv_len+1] == '"' ) {
 						/* double dquote */
 						is->bv_len += 2;
@@ -3266,6 +3266,8 @@ serialNumberAndIssuerCheck(
 					}
 					break;
 				}
+				if ( !gotquote ) return LDAP_INVALID_SYNTAX;
+
 				x.bv_val += is->bv_len + 1;
 				x.bv_len -= is->bv_len + 1;
 
@@ -3785,7 +3787,7 @@ issuerAndThisUpdateCheck(
 
 	if ( in->bv_len < STRLENOF( "{issuer \"\",thisUpdate \"YYMMDDhhmmssZ\"}" ) ) return LDAP_INVALID_SYNTAX;
 
-	if ( in->bv_val[0] != '{' && in->bv_val[in->bv_len-1] != '}' ) {
+	if ( in->bv_val[0] != '{' || in->bv_val[in->bv_len-1] != '}' ) {
 		return LDAP_INVALID_SYNTAX;
 	}
 
@@ -3875,6 +3877,8 @@ issuerAndThisUpdateCheck(
 					break;
 				}
 			}
+			if ( tu->bv_len < STRLENOF("YYYYmmddHHmmssZ") ) return LDAP_INVALID_SYNTAX;
+
 			x.bv_val += tu->bv_len + 1;
 			x.bv_len -= tu->bv_len + 1;
 
@@ -4274,7 +4278,7 @@ serialNumberAndIssuerSerialCheck(
 	if ( in->bv_len < 3 ) return LDAP_INVALID_SYNTAX;
 
 	/* no old format */
-	if ( in->bv_val[0] != '{' && in->bv_val[in->bv_len-1] != '}' ) return LDAP_INVALID_SYNTAX;
+	if ( in->bv_val[0] != '{' || in->bv_val[in->bv_len-1] != '}' ) return LDAP_INVALID_SYNTAX;
 
 	x.bv_val++;
 	x.bv_len -= 2;
@@ -5302,8 +5306,8 @@ csnNormalize23(
 	}
 	*ptr = '\0';
 
-	assert( ptr == &bv.bv_val[bv.bv_len] );
-	if ( csnValidate( syntax, &bv ) != LDAP_SUCCESS ) {
+	if ( ptr != &bv.bv_val[bv.bv_len] ||
+		csnValidate( syntax, &bv ) != LDAP_SUCCESS ) {
 		return LDAP_INVALID_SYNTAX;
 	}
 
